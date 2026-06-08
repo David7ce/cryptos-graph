@@ -11,21 +11,27 @@ $coins = [ordered]@{
   dogecoin = "DOGE"
 }
 
-$days = 365
 $daySeconds = 24 * 60 * 60
 $dataFile = Join-Path $PSScriptRoot "crypto-data.json"
 
 function Get-History {
   param(
     [Parameter(Mandatory = $true)] [string] $Symbol,
-    [Parameter(Mandatory = $true)] [int] $Limit,
-    [Parameter(Mandatory = $false)] [Nullable[long]] $ToTs
+    [Parameter(Mandatory = $false)] [int] $Limit = 0,
+    [Parameter(Mandatory = $false)] [Nullable[long]] $ToTs,
+    [Parameter(Mandatory = $false)] [switch] $All
   )
 
-  $safeLimit = [Math]::Max(1, [Math]::Min($Limit, 2000))
-  $url = "https://min-api.cryptocompare.com/data/v2/histoday?fsym=$Symbol&tsym=USD&limit=$safeLimit"
-  if ($ToTs.HasValue) {
-    $url += "&toTs=$($ToTs.Value)"
+  $url = "https://min-api.cryptocompare.com/data/v2/histoday?fsym=$Symbol&tsym=USD"
+  if ($All) {
+    # allData=true returns the full available daily history for the symbol.
+    $url += "&allData=true"
+  } else {
+    $safeLimit = [Math]::Max(1, [Math]::Min($Limit, 2000))
+    $url += "&limit=$safeLimit"
+    if ($ToTs.HasValue) {
+      $url += "&toTs=$($ToTs.Value)"
+    }
   }
 
   $resp = Invoke-RestMethod -UseBasicParsing $url
@@ -33,7 +39,9 @@ function Get-History {
     throw "No history data for $Symbol"
   }
 
-  return @($resp.Data.Data | Where-Object { $_.time -ne $null -and $_.close -ne $null } | ForEach-Object {
+  # Drop pre-inception padding: the API returns close = 0 for dates before the
+  # coin existed, which is not a real price.
+  return @($resp.Data.Data | Where-Object { $_.time -ne $null -and $_.close -ne $null -and $_.close -gt 0 } | ForEach-Object {
     [ordered]@{
       time = [int64] $_.time
       close = [double] $_.close
@@ -73,7 +81,7 @@ if (Test-Path $dataFile) {
 
 $out = [ordered]@{
   generatedAt = (Get-Date).ToUniversalTime().ToString("o")
-  days = $days
+  range = "all"
   coins = [ordered]@{}
 }
 
@@ -82,7 +90,7 @@ foreach ($id in $coins.Keys) {
   $baseHistory = @()
 
   if ($existing -and $existing.ContainsKey("coins") -and $existing.coins.ContainsKey($id) -and $existing.coins[$id].ContainsKey("history")) {
-    $baseHistory = @($existing.coins[$id].history | Where-Object { $_.time -ne $null -and $_.close -ne $null } | ForEach-Object {
+    $baseHistory = @($existing.coins[$id].history | Where-Object { $_.time -ne $null -and $_.close -ne $null -and $_.close -gt 0 } | ForEach-Object {
       [ordered]@{
         time = [int64] $_.time
         close = [double] $_.close
@@ -91,21 +99,19 @@ foreach ($id in $coins.Keys) {
   }
 
   if ($baseHistory.Count -eq 0) {
-    $history = Get-History -Symbol $sym -Limit $days -ToTs $todayStartTs
+    # First time for this coin: pull the entire available daily history.
+    $history = Get-History -Symbol $sym -All
   } else {
     $lastTs = [int64]$baseHistory[-1].time
     $missingDays = [Math]::Max(0, [Math]::Ceiling(($todayStartTs - $lastTs) / [double]$daySeconds))
 
     if ($missingDays -gt 0) {
+      # Top up only the recent days and merge into the stored full history.
       $incoming = Get-History -Symbol $sym -Limit ($missingDays + 2) -ToTs $todayStartTs
       $history = Merge-History -Base $baseHistory -Incoming $incoming
     } else {
       $history = $baseHistory
     }
-  }
-
-  if ($history.Count -gt ($days + 1)) {
-    $history = @($history | Select-Object -Last ($days + 1))
   }
 
   if ($history.Count -eq 0) {

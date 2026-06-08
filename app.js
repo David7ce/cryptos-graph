@@ -23,8 +23,20 @@ const palette = [
 
 const DATA_FILE = "./crypto-data.json";
 const THEME_KEY = "cryptos-graph-theme";
+const DAY = 86400;
+
+// Selectable time ranges. `days: null` means the full available history.
+const RANGES = {
+  "3m": { label: "3M", days: 90 },
+  "6m": { label: "6M", days: 182 },
+  "1y": { label: "1Y", days: 365 },
+  "5y": { label: "5Y", days: 365 * 5 },
+  "all": { label: "All", days: null }
+};
+const DEFAULT_RANGE = "1y";
 
 let chart;
+const state = { data: null, range: DEFAULT_RANGE };
 
 /* ---------- Theme (light / dark) ---------- */
 
@@ -86,6 +98,12 @@ function setLoading(isLoading) {
   if (btn) btn.disabled = isLoading;
 }
 
+function setActiveRange() {
+  document.querySelectorAll("[data-range]").forEach(btn => {
+    btn.classList.toggle("active", btn.dataset.range === state.range);
+  });
+}
+
 /* ---------- Data ---------- */
 
 async function loadLocalData() {
@@ -102,13 +120,6 @@ async function loadLocalData() {
   return payload;
 }
 
-// Base-100 normalization relative to the first value in the series.
-function normalize(arr) {
-  const base = arr[0];
-  if (!base) return arr.map(() => null);
-  return arr.map(v => (v / base) * 100);
-}
-
 function formatDate(unixSeconds) {
   return new Date(unixSeconds * 1000).toLocaleDateString("en-US", {
     day: "2-digit",
@@ -117,13 +128,73 @@ function formatDate(unixSeconds) {
   });
 }
 
+// Build aligned, base-100 datasets for the selected window.
+//
+// Coins can start on different dates (e.g. SOL vs BTC), so we align every
+// series onto the union of all daily timestamps in the window and leave gaps
+// (null) before each coin exists. Each series is re-anchored to 100 at its
+// first available point within the window.
+function buildSeries(data, cutoffTs) {
+  const perCoin = [];
+  const failed = [];
+  const allTimes = new Set();
+
+  Object.entries(coins).forEach(([id, label], index) => {
+    const history = data.coins[id]?.history;
+    if (!Array.isArray(history) || history.length === 0) {
+      failed.push(label);
+      return;
+    }
+
+    const points = history
+      // close > 0 drops pre-inception padding (CryptoCompare reports 0 before
+      // a coin existed), which would otherwise make the base-100 anchor zero.
+      .filter(p => typeof p?.time === "number" && typeof p?.close === "number" && p.close > 0 &&
+        (cutoffTs === null || p.time >= cutoffTs))
+      .sort((a, b) => a.time - b.time);
+
+    if (points.length === 0) {
+      failed.push(label);
+      return;
+    }
+
+    points.forEach(p => allTimes.add(p.time));
+    perCoin.push({ label, color: palette[index % palette.length], points });
+  });
+
+  const times = [...allTimes].sort((a, b) => a - b);
+  const indexByTime = new Map(times.map((t, i) => [t, i]));
+  const labels = times.map(formatDate);
+
+  const datasets = perCoin.map(coin => {
+    const base = coin.points[0].close;
+    const series = new Array(times.length).fill(null);
+    for (const p of coin.points) {
+      series[indexByTime.get(p.time)] = (p.close / base) * 100;
+    }
+    return {
+      label: coin.label,
+      data: series,
+      borderColor: coin.color,
+      backgroundColor: coin.color,
+      borderWidth: 2,
+      pointRadius: 0,
+      pointHoverRadius: 4,
+      spanGaps: false,
+      fill: false,
+      tension: 0.1
+    };
+  });
+
+  return { labels, datasets, failed };
+}
+
 async function loadData() {
   setLoading(true);
   setStatus("Loading data from local file...");
 
-  let localData;
   try {
-    localData = await loadLocalData();
+    state.data = await loadLocalData();
   } catch (err) {
     console.error(err);
     setStatus("Could not read crypto-data.json. Refresh or generate the local file.", true);
@@ -131,77 +202,46 @@ async function loadData() {
     return;
   }
 
-  let labels = [];
-  const datasets = [];
-  const failedCoins = [];
-
-  Object.entries(coins).forEach(([id, label], index) => {
-    try {
-      const history = localData.coins[id]?.history;
-      if (!Array.isArray(history) || history.length === 0) {
-        throw new Error(`No history in file for ${label}`);
-      }
-
-      // The snapshot does not guarantee chronological order: sort by time
-      // so the base 100 and the X axis are correct.
-      const points = history
-        .filter(p => typeof p?.time === "number" && typeof p?.close === "number")
-        .sort((a, b) => a.time - b.time);
-
-      if (points.length === 0) {
-        throw new Error(`Invalid prices for ${label}`);
-      }
-
-      const norm = normalize(points.map(p => p.close));
-
-      // Use the dates from the longest series as X-axis labels.
-      if (points.length > labels.length) {
-        labels = points.map(p => formatDate(p.time));
-      }
-
-      const color = palette[index % palette.length];
-      datasets.push({
-        label,
-        data: norm,
-        borderColor: color,
-        backgroundColor: color,
-        borderWidth: 2,
-        pointRadius: 0,
-        pointHoverRadius: 4,
-        fill: false,
-        tension: 0.1
-      });
-    } catch (err) {
-      failedCoins.push(label);
-      console.error(`Error loading ${label}:`, err);
-    }
-  });
-
-  if (datasets.length === 0) {
-    setStatus("Could not load data. Try again in a few seconds.", true);
-    setLoading(false);
-    return;
-  }
-
-  renderChart(labels, datasets);
-
-  if (failedCoins.length > 0) {
-    setStatus(`Chart loaded partially. Failed: ${failedCoins.join(", ")}`, true);
-  } else {
-    const sourceTime = localData.generatedAt
-      ? ` (snapshot: ${formatDate(Date.parse(localData.generatedAt) / 1000)})`
-      : "";
-    setStatus(`Local data loaded successfully${sourceTime}.`);
-  }
-
+  render();
   setLoading(false);
 }
 
-function renderChart(labels, datasets) {
+function render() {
+  if (!state.data) return;
+
+  const cfg = RANGES[state.range] ?? RANGES[DEFAULT_RANGE];
+  const nowTs = Math.floor(Date.now() / 1000);
+  const cutoffTs = cfg.days === null ? null : nowTs - cfg.days * DAY;
+
+  const { labels, datasets, failed } = buildSeries(state.data, cutoffTs);
+
+  if (datasets.length === 0) {
+    if (chart) { chart.destroy(); chart = null; }
+    setStatus("No data available for this range.", true);
+    return;
+  }
+
+  renderChart(labels, datasets, state.range);
+
+  if (failed.length > 0) {
+    setStatus(`Showing ${cfg.label} · base 100. Failed: ${failed.join(", ")}`, true);
+  } else {
+    const snapshot = state.data.generatedAt
+      ? ` (snapshot: ${formatDate(Date.parse(state.data.generatedAt) / 1000)})`
+      : "";
+    setStatus(`Showing ${cfg.label} · base 100${snapshot}.`);
+  }
+}
+
+function renderChart(labels, datasets, range) {
   if (chart) chart.destroy();
 
   const ctx = document.getElementById("chart");
   const theme = document.documentElement.getAttribute("data-theme") || "light";
+
+  // "All" spans very different magnitudes (coins start at different dates),
+  // so a log axis keeps every series readable.
+  const isAll = range === "all";
 
   chart = new Chart(ctx, {
     type: "line",
@@ -215,19 +255,22 @@ function renderChart(labels, datasets) {
         legend: { labels: { usePointStyle: true } },
         tooltip: {
           callbacks: {
-            label: (item) => `${item.dataset.label}: ${item.parsed.y.toFixed(1)}`
+            label: (item) => item.parsed.y == null
+              ? null
+              : `${item.dataset.label}: ${item.parsed.y.toFixed(1)}`
           }
         }
       },
       scales: {
         y: {
-          title: { display: true, text: "Base 100" },
+          type: isAll ? "logarithmic" : "linear",
+          title: { display: true, text: isAll ? "Base 100 (log)" : "Base 100" },
           ticks: {},
           grid: {}
         },
         x: {
           title: { display: true, text: "Date" },
-          ticks: { maxTicksLimit: 12, autoSkip: true, maxRotation: 0 },
+          ticks: { maxTicksLimit: 10, autoSkip: true, maxRotation: 0 },
           grid: {}
         }
       }
@@ -241,6 +284,15 @@ function renderChart(labels, datasets) {
 
 applyTheme(getPreferredTheme());
 document.getElementById("theme-toggle")?.addEventListener("click", toggleTheme);
+
+document.querySelectorAll("[data-range]").forEach(btn => {
+  btn.addEventListener("click", () => {
+    state.range = btn.dataset.range;
+    setActiveRange();
+    render();
+  });
+});
+setActiveRange();
 
 // Follow the system theme change if the user has not chosen manually.
 window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
